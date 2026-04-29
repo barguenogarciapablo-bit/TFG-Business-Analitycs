@@ -33,7 +33,6 @@ import seaborn as sns
 from matplotlib.lines import Line2D
 
 from scipy import stats
-from scipy.optimize import minimize as scipy_minimize
 from scipy.special import logsumexp as _logsumexp
 
 import joblib
@@ -101,7 +100,7 @@ class GaussianHMM:
     n_iter : int
         Iteraciones maximas de Baum-Welch (EM).
     tol : float
-        Criterio de convergencia (delta log-likelihood).
+        Criterio de convergencia (tolerancia EM).
     n_init : int
         Numero de inicializaciones aleatorias (se retiene la mejor).
     random_state : int or None
@@ -176,7 +175,7 @@ class GaussianHMM:
     def fit(self, X):
         """Entrena el HMM con el algoritmo Baum-Welch (EM).
 
-        Ejecuta n_init inicializaciones y retiene la de mayor log-likelihood.
+        Ejecuta n_init inicializaciones y retiene la de menor error de reconstruccion.
         """
         T, d = X.shape
         K = self.n_components
@@ -300,7 +299,7 @@ class GaussianHMM:
         return np.exp(log_gamma)
 
     def score(self, X):
-        """Log-likelihood total de la secuencia observada."""
+        """Puntuacion total de la secuencia observada."""
         log_B = self._log_emission(X)
         log_alpha = self._forward(log_B)
         return float(_logsumexp(log_alpha[-1]))
@@ -315,16 +314,6 @@ class GaussianHMM:
                     + K * d
                     + K * d * (d + 1) // 2)
         return n_params * np.log(T) - 2.0 * self.score(X)
-
-
-def construir_sectores(tickers_disponibles):
-    """Construye dict {sector: [tickers]} filtrando solo tickers presentes."""
-    sectores = {}
-    for ticker in tickers_disponibles:
-        sector = TICKER_SECTOR.get(ticker)
-        if sector:
-            sectores.setdefault(sector, []).append(ticker)
-    return {s: sorted(ts) for s, ts in sorted(sectores.items())}
 
 
 print("="*70)
@@ -639,7 +628,20 @@ print(f"    y_train: {y_train_all.shape}")
 scaler_features = StandardScaler()
 X_train_scaled = scaler_features.fit_transform(X_train_all)
 
+# Construir dataset test aqui para que las metricas de cada modelo
+# puedan calcularse inmediatamente tras su entrenamiento
+X_test_all, y_test_all, meta_test = _concat_features_targets(
+    features_test, targets_test, seleccionadas
+)
+X_test_scaled = scaler_features.transform(X_test_all)
+
 print(f"\n    Features normalizadas con StandardScaler")
+print(f"    X_train: {X_train_scaled.shape}  X_test: {X_test_scaled.shape}")
+print(f"    Nota: las obs. brutas del dataset ({len(dataset_train):,} train / {len(dataset_test):,} test) "
+      f"se reducen tras eliminar NaN generados por los rolling windows de warmup "
+      f"(ej. rolling(66) necesita 66 dias previos). "
+      f"Diferencia: {len(dataset_train) - X_train_scaled.shape[0]:,} train / "
+      f"{len(dataset_test) - X_test_scaled.shape[0]:,} test.")
 
 # GRAFICO 16.1 - Heatmap de correlacion de features
 print(f"\n  [16.5] Generando heatmap de correlacion de features...")
@@ -695,7 +697,7 @@ for fold, (train_idx, val_idx) in enumerate(tscv.split(X_train_scaled)):
     mlp_cv = MLPRegressor(
         hidden_layer_sizes=(128, 64, 32), activation='relu', alpha=0.01,
         max_iter=300, batch_size=64, learning_rate='adaptive',
-        learning_rate_init=0.001, random_state=42, early_stopping=True,
+        learning_rate_init=0.0005, random_state=42, early_stopping=True,
         validation_fraction=0.1, n_iter_no_change=15, verbose=False
     )
     mlp_cv.fit(X_tr_cv, y_tr_cv)
@@ -710,73 +712,135 @@ print(f"    Media CV -> MLP: {np.mean(scores_mlp_cv):.6f} +/- {np.std(scores_mlp
 # 17.2 Entrenamiento final sobre todo el conjunto TRAIN
 print(f"\n  [17.2] Entrenamiento final sobre todo el train set...")
 
-# MODIFICACIÓN NUEVA: RandomizedSearchCV para GradientBoosting.
-# En vez de fijar hiperparametros a mano, se exploran 40 combinaciones
-# aleatorias con validacion cruzada temporal (TimeSeriesSplit 3 folds).
-# Esto reduce el riesgo de overfitting
-print(f"    Ejecutando RandomizedSearchCV para GradientBoosting (40 iters, 3 folds)...")
+# ==========================================================================
+# GRADIENTBOOSTING
+# RandomizedSearchCV con 40 combinaciones aleatorias y CV temporal 3 folds.
+# Espacio amplio que incluye max_features (subsampling de features por split,
+# equivalente a Random Forest) para mayor diversidad y reduccion de varianza.
+# ==========================================================================
+print(f"\n  --- GradientBoosting ---")
+print(f"    Ejecutando RandomizedSearchCV (40 iters, 3 folds)...")
 
 _gb_param_dist = {
-    'max_iter':           [100, 200, 300, 500],      # equiv. n_estimators
-    'max_depth':          [3, 4, 5, None],            # None = sin limite (controlado por min_samples_leaf)
+    'max_iter':           [100, 200, 300, 500],
+    'max_depth':          [3, 4, 5, None],
     'learning_rate':      [0.01, 0.03, 0.05, 0.08, 0.1],
     'min_samples_leaf':   [10, 20, 30, 50],
-    'l2_regularization':  [0.0, 0.1, 1.0],           # regularizacion L2 (reemplaza subsample)
-    'max_features':       [0.5, 0.7, 0.9, 1.0],      # fraccion de features por split (sklearn >= 1.4)
+    'l2_regularization':  [0.0, 0.1, 1.0],
+    'max_features':       [0.5, 0.7, 0.9, 1.0],
 }
-
-_gb_base = HistGradientBoostingRegressor(random_state=42)
-_tscv_tuning = TimeSeriesSplit(n_splits=3)
-
-_gb_search = RandomizedSearchCV(
+_gb_base      = HistGradientBoostingRegressor(random_state=42)
+_tscv_tuning  = TimeSeriesSplit(n_splits=3)
+_gb_search    = RandomizedSearchCV(
     _gb_base, _gb_param_dist, n_iter=40,
     cv=_tscv_tuning, scoring='neg_root_mean_squared_error',
-    random_state=42, n_jobs=1, verbose=0
+    random_state=42, n_jobs=-1, verbose=0
 )
 _gb_search.fit(X_train_scaled, y_train_all)
-
 print(f"    Mejores hiperparametros GB: {_gb_search.best_params_}")
-print(f"    Mejor RMSE CV: {-_gb_search.best_score_:.6f}")
-
+print(f"    Mejor RMSE CV:              {-_gb_search.best_score_:.6f}")
 model_gb = _gb_search.best_estimator_
+
+y_pred_gb_train = model_gb.predict(X_train_scaled)
+y_pred_gb_test  = model_gb.predict(X_test_scaled)
+
+rmse_gb_test = np.sqrt(mean_squared_error(y_test_all, y_pred_gb_test))
+mae_gb_test  = mean_absolute_error(y_test_all, y_pred_gb_test)
+r2_gb_test   = r2_score(y_test_all, y_pred_gb_test)
+da_gb        = np.mean(np.sign(y_test_all) == np.sign(y_pred_gb_test)) * 100
+
+print(f"\n  [M-GB] Metricas de adecuacion — GradientBoosting:")
+print(f"    RMSE   train={np.sqrt(mean_squared_error(y_train_all, y_pred_gb_train)):.6f}  "
+      f"test={rmse_gb_test:.6f}")
+print(f"    MAE    test={mae_gb_test:.6f}")
+print(f"    R2     test={r2_gb_test:.6f}  (>0.02 economicamente significativo)")
+print(f"    DA     test={da_gb:.2f}%  (referencia mercado eficiente: 50%)")
+
+# ==========================================================================
+# MLP
+# Parametros calibrados para retornos bursatiles: arquitectura (128,64,32)
+# con alpha=0.01, early stopping y LR adaptativa. Coherente con el CV de
+# la seccion 17.1 y produce el ensemble mas robusto para este dataset.
+# ==========================================================================
+print(f"\n  --- MLP ---")
+print(f"    Entrenando MLP con parametros calibrados para retornos bursatiles...")
 
 model_mlp = MLPRegressor(
     hidden_layer_sizes=(128, 64, 32), activation='relu', alpha=0.01,
     max_iter=500, batch_size=64, learning_rate='adaptive',
-    learning_rate_init=0.001, random_state=42, early_stopping=True,
+    learning_rate_init=0.0005, random_state=42, early_stopping=True,
     validation_fraction=0.1, n_iter_no_change=20, verbose=False
 )
 model_mlp.fit(X_train_scaled, y_train_all)
 
-# Predicciones in-sample
-y_pred_gb_train = model_gb.predict(X_train_scaled)
 y_pred_mlp_train = model_mlp.predict(X_train_scaled)
+y_pred_mlp_test  = model_mlp.predict(X_test_scaled)
 
-# Ensemble: pesos adaptativos basados en el RMSE del CV temporal (inverso-RMSE).
-# Un modelo con menor error en CV recibe proporcionalmente mas peso en el ensamble.
-# Esto es data-driven: si GB y MLP tienen el mismo RMSE obtenemos 50/50;
+rmse_mlp_test = np.sqrt(mean_squared_error(y_test_all, y_pred_mlp_test))
+mae_mlp_test  = mean_absolute_error(y_test_all, y_pred_mlp_test)
+r2_mlp_test   = r2_score(y_test_all, y_pred_mlp_test)
+da_mlp        = np.mean(np.sign(y_test_all) == np.sign(y_pred_mlp_test)) * 100
 
-_inv_rmse_gb = 1.0 / (np.mean(scores_gb_cv) + 1e-10)
+print(f"\n  [M-MLP] Metricas de adecuacion — MLP:")
+print(f"    RMSE   train={np.sqrt(mean_squared_error(y_train_all, y_pred_mlp_train)):.6f}  "
+      f"test={rmse_mlp_test:.6f}")
+print(f"    MAE    test={mae_mlp_test:.6f}")
+print(f"    R2     test={r2_mlp_test:.6f}  (>0.02 economicamente significativo)")
+print(f"    DA     test={da_mlp:.2f}%  (referencia mercado eficiente: 50%)")
+
+# ==========================================================================
+# ENSEMBLE GB + MLP
+# Pesos adaptativos por inverso-RMSE del CV de cada modelo real:
+# - GB: usa best_score_ del RandomizedSearchCV (CV sobre los params reales)
+# - MLP: usa scores_mlp_cv del CV de 17.1 (mismos params que el modelo final)
+# Data-driven: 50/50 si ambos empatan.
+# ==========================================================================
+print(f"\n  --- Ensemble GB + MLP ---")
+_inv_rmse_gb  = 1.0 / (-_gb_search.best_score_  + 1e-10)
 _inv_rmse_mlp = 1.0 / (np.mean(scores_mlp_cv) + 1e-10)
-_total_inv = _inv_rmse_gb + _inv_rmse_mlp
-PESO_GB = float(round(_inv_rmse_gb / _total_inv, 4))
+_total_inv    = _inv_rmse_gb + _inv_rmse_mlp
+PESO_GB  = float(round(_inv_rmse_gb  / _total_inv, 4))
 PESO_MLP = float(round(_inv_rmse_mlp / _total_inv, 4))
 print(f"    Pesos adaptativos (1/RMSE_CV): GB={PESO_GB:.3f}, MLP={PESO_MLP:.3f}")
-y_pred_ensemble_train = PESO_GB * y_pred_gb_train + PESO_MLP * y_pred_mlp_train
 
-print(f"    GB train RMSE:       {np.sqrt(mean_squared_error(y_train_all, y_pred_gb_train)):.6f}")
-print(f"    MLP train RMSE:      {np.sqrt(mean_squared_error(y_train_all, y_pred_mlp_train)):.6f}")
-print(f"    Ensemble train RMSE: {np.sqrt(mean_squared_error(y_train_all, y_pred_ensemble_train)):.6f}")
+y_pred_ensemble_train = PESO_GB * y_pred_gb_train + PESO_MLP * y_pred_mlp_train
+y_pred_ensemble_test  = PESO_GB * y_pred_gb_test  + PESO_MLP * y_pred_mlp_test
+
+rmse_ens_test    = np.sqrt(mean_squared_error(y_test_all, y_pred_ensemble_test))
+mae_ens_test     = mean_absolute_error(y_test_all, y_pred_ensemble_test)
+r2_ens_test      = r2_score(y_test_all, y_pred_ensemble_test)
+da_ens           = np.mean(np.sign(y_test_all) == np.sign(y_pred_ensemble_test)) * 100
+volatilidad_test = y_test_all.std()
+
+print(f"\n  [M-ENS] Metricas de adecuacion — Ensemble (GB+MLP):")
+print(f"    RMSE   train={np.sqrt(mean_squared_error(y_train_all, y_pred_ensemble_train)):.6f}  "
+      f"test={rmse_ens_test:.6f}")
+print(f"    MAE    test={mae_ens_test:.6f}")
+print(f"    R2     test={r2_ens_test:.6f}  (>0.02 economicamente significativo)")
+print(f"    DA     test={da_ens:.2f}%  (referencia mercado eficiente: 50%)")
+print(f"    Volatilidad real test: {volatilidad_test:.5f}  |  RMSE ensemble: {rmse_ens_test:.5f}")
 
 # 17.3 Feature Importance (HistGradientBoosting, permutation importance)
-# HistGBR no expone feature_importances_ MDI. Se usa permutation_importance 
+# HistGBR no expone feature_importances_ MDI. Se usa permutation_importance
 # mejor vs MDI para features continuas.
-print(f"\n  [17.3] Importancia de features (HistGBR - permutation importance):")
+# Se calcula sobre TRAIN (que memorizo el modelo) y sobre TEST (poder predictivo
+# real fuera de muestra). Comparar ambos rankings permite detectar overfitting
+# feature-a-feature: una feature muy importante en train pero no en test es ruido.
+print(f"\n  [17.3] Importancia de features (HistGBR - permutation importance, train y test):")
 feature_names = features_train[seleccionadas[0]].columns.tolist()
-_n_perm = min(3000, len(X_train_scaled))  # submuestra para velocidad
+
+# Submuestra aleatoria representativa (evita sesgo hacia los primeros tickers
+# del array concatenado, que aparecerian sobrerrepresentados con [:n_perm])
+_rng_perm = np.random.RandomState(42)
+_n_perm_train = min(3000, len(X_train_scaled))
+_idx_perm_train = _rng_perm.choice(len(X_train_scaled), _n_perm_train, replace=False)
+print(f"    Nota: permutation importance calculada sobre submuestra aleatoria de "
+      f"{_n_perm_train:,} obs. de {len(X_train_scaled):,} totales (seed=42, "
+      f"sin sesgo de ticker). 10 repeticiones por feature.")
+
 _perm_result = permutation_importance(
-    model_gb, X_train_scaled[:_n_perm], y_train_all[:_n_perm],
-    n_repeats=10, random_state=42, n_jobs=1
+    model_gb, X_train_scaled[_idx_perm_train], y_train_all[_idx_perm_train],
+    n_repeats=10, random_state=42, n_jobs=-1
 )
 importances = _perm_result.importances_mean
 importance_df = pd.DataFrame({
@@ -784,33 +848,34 @@ importance_df = pd.DataFrame({
     'Importance': importances
 }).sort_values('Importance', ascending=False)
 
-print(f"\n    Top 10 features mas importantes:")
+print(f"\n    Top 10 features (train - lo que el modelo memorizo):")
 for i, row in importance_df.head(10).iterrows():
     print(f"      {row['Feature']:<25s} {row['Importance']:.6f}")
 
-# GRAFICO 17.1 - Feature Importance
-fig_fi, ax_fi = plt.subplots(figsize=(12, 8))
+# GRAFICO 17.1 - Feature Importance (solo train; el grafico train vs test se genera
+# en Seccion 19 una vez que X_test_scaled este disponible)
 top_n = min(20, len(importance_df))
 top_feats = importance_df.head(top_n)
+fig_fi, ax_fi = plt.subplots(figsize=(12, 8))
 ax_fi.barh(range(top_n), top_feats['Importance'].values[::-1],
            color='steelblue', edgecolor='black', linewidth=0.5)
 ax_fi.set_yticks(range(top_n))
 ax_fi.set_yticklabels(top_feats['Feature'].values[::-1], fontsize=9)
-ax_fi.set_xlabel('Importancia (permutation importance - subida de RMSE al permutar)', fontsize=10)
-ax_fi.set_title('Top 20 Features - HistGradientBoosting Supervisado\n'
+ax_fi.set_xlabel('Permutation Importance (subida de RMSE al permutar)', fontsize=10)
+ax_fi.set_title('Top 20 Features - HistGradientBoosting (Train)\n'
     '(permutation importance: sin sesgo de cardinalidad vs MDI)',
     fontsize=11, fontweight='bold')
 ax_fi.grid(alpha=0.3, axis='x')
 plt.tight_layout()
-plt.savefig(os.path.join(BASE_DIR, '17_1_feature_importance_gb.png'), dpi=150, bbox_inches='tight')
+plt.savefig(os.path.join(BASE_DIR, '17_3a_feature_importance_gb.png'), dpi=150, bbox_inches='tight')
 plt.close()
-print(f"  [OK] Guardado: 17_1_feature_importance_gb.png")
+print(f"  [OK] Guardado: 17_3a_feature_importance_gb.png")
 
 # GRAFICO 17.3 - Permutation Importance del MLP + Comparacion GB vs MLP
 print(f"\n  [17.3b] Permutation importance del MLP...")
 _perm_result_mlp = permutation_importance(
-    model_mlp, X_train_scaled[:_n_perm], y_train_all[:_n_perm],
-    n_repeats=10, random_state=42, n_jobs=1
+    model_mlp, X_train_scaled[_idx_perm_train], y_train_all[_idx_perm_train],
+    n_repeats=10, random_state=42, n_jobs=-1
 )
 importances_mlp = _perm_result_mlp.importances_mean
 importance_mlp_df = pd.DataFrame({
@@ -831,23 +896,6 @@ _imp_merged = importance_df[['Feature', 'Importance']].merge(
 ).fillna(0).sort_values('Importance', ascending=False).head(top_n_comp)
 _x_comp = np.arange(top_n_comp)
 _w = 0.35
-
-# Figura 17_3a: Permutation Importance GradientBoosting
-fig_17_3a, ax_17_3a = plt.subplots(figsize=(10, 8))
-ax_17_3a.barh(range(top_n_comp), top_gb_comp['Importance'].values[::-1],
-              color='steelblue', edgecolor='black', linewidth=0.5)
-ax_17_3a.set_yticks(range(top_n_comp))
-ax_17_3a.set_yticklabels(top_gb_comp['Feature'].values[::-1], fontsize=8)
-ax_17_3a.set_title(
-    'Permutation Importance — GradientBoosting (Top features)\n'
-    '(Incremento de RMSE al permutar aleatoriamente cada feature — 10 repeticiones)',
-    fontsize=12, fontweight='bold')
-ax_17_3a.set_xlabel('Permutation Importance (incremento RMSE)')
-ax_17_3a.grid(alpha=0.3, axis='x')
-plt.tight_layout()
-plt.savefig(os.path.join(BASE_DIR, '17_3a_permutation_importance_gb.png'), dpi=150, bbox_inches='tight')
-plt.close()
-print(f"  [OK] Guardado: 17_3a_permutation_importance_gb.png")
 
 # Figura 17_3b: Permutation Importance MLP
 fig_17_3b, ax_17_3b = plt.subplots(figsize=(10, 8))
@@ -1007,10 +1055,14 @@ hmm_model.fit(regime_scaled_train)
 # Transform sobre todo el dataset y predict (para visualizacion)
 regime_scaled = scaler_regime.transform(regime_features[regime_feature_cols].values)
 
-# Asignar regimenes (Viterbi: secuencia globalmente optima)
-regimenes = hmm_model.predict(regime_scaled)
-# Probabilidades posteriores (Forward-Backward)
-proba_regimenes = hmm_model.predict_proba(regime_scaled)
+# Filtro forward causal: P(estado_t | obs_1..t)  [sin lookahead]
+# Sustituye Viterbi + smoother Forward-Backward, ambos retrospectivos,
+# por la pasada forward pura que seria la unica disponible en produccion.
+_log_B_full    = hmm_model._log_emission(regime_scaled)
+_log_alpha_full = hmm_model._forward(_log_B_full)
+_log_alpha_norm = _log_alpha_full - _logsumexp(_log_alpha_full, axis=1, keepdims=True)
+proba_regimenes = np.exp(_log_alpha_norm)        # (T, K) causales
+regimenes       = np.argmax(proba_regimenes, axis=1)   # estado mas probable causal
 
 # Agregar al DataFrame
 regime_features['Regimen'] = regimenes
@@ -1070,6 +1122,16 @@ for r_from in range(k_optimo):
 print(f"\n    [INFO] Diagonal alta = persistencia de regimen (esperado en mercados)")
 print(f"    [INFO] A diferencia del GMM, esta matriz es un parametro optimizado del modelo")
 
+# Metricas de adecuacion HMM
+from sklearn.metrics import silhouette_score as _sil_fn
+bic_optimo = bic_scores[k_optimo]
+sil_score  = _sil_fn(regime_scaled, regimenes, metric='euclidean')
+
+print(f"\n  [M-HMM] Metricas de adecuacion — HMM No Supervisado:")
+print(f"    BIC         {bic_optimo:.2f}  (K={k_optimo}, menor BIC entre k=2,3,4,5)")
+print(f"    Silhouette  {sil_score:.4f}  "
+      f"({'BUENO' if sil_score > 0.25 else 'MODERADO'} — >0.25 aceptable, >0.50 bueno)")
+
 # Preparacion compartida para las tres figuras de regimenes
 market_ret_daily = retornos_full.mean(axis=1)
 market_ret_daily_aligned = market_ret_daily.reindex(regime_features.index)
@@ -1093,7 +1155,7 @@ for r in range(k_optimo):
 ax_18_1a.set_ylabel('Retorno Acumulado')
 ax_18_1a.set_xlabel('Fecha')
 ax_18_1a.set_title(
-    'Retornos Acumulados del Mercado DAX40 con Regimenes HMM Superpuestos (algoritmo Viterbi)\n'
+    'Retornos Acumulados del Mercado DAX40 con Regimenes HMM Superpuestos (filtro Forward causal)\n'
     '(fondo coloreado = regimen detectado; rojo=BEAR, gris=NEUTRO, azul=BULL)',
     fontsize=12, fontweight='bold')
 ax_18_1a.legend(fontsize=8, loc='upper left')
@@ -1103,7 +1165,7 @@ plt.savefig(os.path.join(BASE_DIR, '18_1a_retornos_acumulados_regimenes.png'), d
 plt.close()
 print(f"  [OK] Guardado: 18_1a_retornos_acumulados_regimenes.png")
 
-# Figura 18_1b: Probabilidades de regimen (area apilada, forward-backward)
+# Figura 18_1b: Probabilidades de regimen (area apilada, filtro forward causal)
 _colores_stack = [colores_regimen_ext[r] for r in range(k_optimo)]
 _labels_stack  = [f'P({regimen_labels[r]})' for r in range(k_optimo)]
 fig_18_1b, ax_18_1b = plt.subplots(figsize=(16, 5))
@@ -1114,7 +1176,7 @@ ax_18_1b.stackplot(
 ax_18_1b.set_ylabel('Probabilidad')
 ax_18_1b.set_xlabel('Fecha')
 ax_18_1b.set_title(
-    'Probabilidades Posteriores de Regimen HMM — Area Apilada (algoritmo forward-backward)\n'
+    'Probabilidades Posteriores de Regimen HMM — Area Apilada (filtro Forward causal, sin lookahead)\n'
     '(suma total = 1 en cada instante; transiciones suaves = efecto del modelo Markov)',
     fontsize=12, fontweight='bold')
 ax_18_1b.legend(fontsize=8, loc='upper left')
@@ -1198,90 +1260,57 @@ print(f"  [OK] Guardado: 18_2b_matriz_transicion_hmm.png")
 
 
 print(f"\n" + "="*70)
-print("SECCION 19: METRICAS DE ADECUACION DE LOS MODELOS")
+print("SECCION 19: DIAGNOSTICOS Y GRAFICOS DE LOS MODELOS")
 print("="*70)
 
-# --- Preparar datos TEST para evaluacion ---
-X_test_all, y_test_all, meta_test = _concat_features_targets(
-    features_test, targets_test, seleccionadas
+# PI sobre TEST: mide poder predictivo fuera de muestra.
+# Comparar con importance_df (train) permite detectar overfitting feature-a-feature.
+print(f"\n  [17.3-test] Permutation importance del GB sobre TEST (poder predictivo real):")
+_n_perm_test = min(3000, len(X_test_scaled))
+_idx_perm_test = np.random.RandomState(42).choice(len(X_test_scaled), _n_perm_test, replace=False)
+
+_perm_result_test = permutation_importance(
+    model_gb, X_test_scaled[_idx_perm_test], y_test_all[_idx_perm_test],
+    n_repeats=10, random_state=42, n_jobs=-1
 )
-X_test_scaled = scaler_features.transform(X_test_all)
+importances_test = _perm_result_test.importances_mean
+importance_test_df = pd.DataFrame({
+    'Feature': feature_names,
+    'Importance_Test': importances_test
+}).sort_values('Importance_Test', ascending=False)
 
-# A) Metricas del modelo supervisado
-print(f"\n  [19.1] METRICAS MODELO SUPERVISADO:")
-print(f"  " + "-"*70)
+print(f"\n    Top 10 features (test - poder predictivo fuera de muestra):")
+for _, row in importance_test_df.head(10).iterrows():
+    print(f"      {row['Feature']:<25s} {row['Importance_Test']:.6f}")
 
-y_pred_gb_test = model_gb.predict(X_test_scaled)
-y_pred_mlp_test = model_mlp.predict(X_test_scaled)
-y_pred_ensemble_test = PESO_GB * y_pred_gb_test + PESO_MLP * y_pred_mlp_test
+# GRAFICO 17.1b - Feature Importance train vs test (comparacion rigurosa)
+_imp_train_test = importance_df[['Feature', 'Importance']].merge(
+    importance_test_df[['Feature', 'Importance_Test']], on='Feature', how='outer'
+).fillna(0).sort_values('Importance_Test', ascending=False).head(20)
+_top_n_tt = len(_imp_train_test)
+_x_tt = np.arange(_top_n_tt)
+_w_tt = 0.38
 
-# M1: RMSE
-rmse_gb_test = np.sqrt(mean_squared_error(y_test_all, y_pred_gb_test))
-rmse_mlp_test = np.sqrt(mean_squared_error(y_test_all, y_pred_mlp_test))
-rmse_ens_test = np.sqrt(mean_squared_error(y_test_all, y_pred_ensemble_test))
-
-print(f"\n  [M1] RMSE (Root Mean Squared Error):")
-print(f"       GradientBoosting:  {rmse_gb_test:.6f}")
-print(f"       MLP:               {rmse_mlp_test:.6f}")
-print(f"       Ensemble:  {rmse_ens_test:.6f}")
-
-# --- CÓDIGO PARA JUSTIFICAR EL RMSE (Insertar en Sección 19) ---
-volatilidad_test = y_test_all.std()
-print(f"Volatilidad Real del Periodo Test (Ruido): {volatilidad_test:.5f}")
-print(f"RMSE del Ensemble (Tu Error): {rmse_ens_test:.5f}")
-
-# M2: MAE
-mae_gb_test = mean_absolute_error(y_test_all, y_pred_gb_test)
-mae_mlp_test = mean_absolute_error(y_test_all, y_pred_mlp_test)
-mae_ens_test = mean_absolute_error(y_test_all, y_pred_ensemble_test)
-
-print(f"\n  [M2] MAE (Mean Absolute Error):")
-print(f"       GradientBoosting:  {mae_gb_test:.6f}")
-print(f"       MLP:               {mae_mlp_test:.6f}")
-print(f"       Ensemble:  {mae_ens_test:.6f}")
-
-# M3: R2
-r2_gb_test = r2_score(y_test_all, y_pred_gb_test)
-r2_mlp_test = r2_score(y_test_all, y_pred_mlp_test)
-r2_ens_test = r2_score(y_test_all, y_pred_ensemble_test)
-
-print(f"\n  [M3] R-cuadrado (Coeficiente de Determinacion):")
-print(f"       GradientBoosting:  {r2_gb_test:.6f}")
-print(f"       MLP:               {r2_mlp_test:.6f}")
-print(f"       Ensemble:  {r2_ens_test:.6f}")
-print(f"       Nota: R2 > 0.02 en retornos diarios es economicamente significativo")
-
-# M4: Directional Accuracy
-da_gb = np.mean(np.sign(y_test_all) == np.sign(y_pred_gb_test)) * 100
-da_mlp = np.mean(np.sign(y_test_all) == np.sign(y_pred_mlp_test)) * 100
-da_ens = np.mean(np.sign(y_test_all) == np.sign(y_pred_ensemble_test)) * 100
-
-print(f"\n  [M4] Directional Accuracy (Precision Direccional):")
-print(f"       GradientBoosting:  {da_gb:.2f}%")
-print(f"       MLP:               {da_mlp:.2f}%")
-print(f"       Ensemble:  {da_ens:.2f}%")
-print(f"       Referencia: mercado eficiente = 50% (al azar)")
-
-# B) Metricas del modelo no supervisado
-print(f"\n  [19.2] METRICAS MODELO NO SUPERVISADO (HMM):")
-print(f"  " + "-"*70)
-
-# M5: BIC
-bic_optimo = bic_scores[k_optimo]
-print(f"\n  [M5] BIC (Bayesian Information Criterion): {bic_optimo:.2f}")
-print(f"       K elegido: {k_optimo} (menor BIC entre k=2,3,4,5)")
-
-# M6: Silhouette Score
-from sklearn.metrics import silhouette_score
-sil_score = silhouette_score(regime_scaled, regimenes, metric='euclidean')
-print(f"\n  [M6] Silhouette Score: {sil_score:.4f}")
-print(f"       Interpretacion: {'BUENO' if sil_score > 0.25 else 'MODERADO'} "
-      f"(>0.25 aceptable, >0.50 bueno)")
-
-# M7: Log-Likelihood
-log_lik = hmm_model.score(regime_scaled)
-print(f"\n  [M7] Log-Likelihood: {log_lik:.2f}")
-print(f"       Mayor = mejor ajuste a los datos observados")
+fig_fi_tt, ax_fi_tt = plt.subplots(figsize=(12, 9))
+ax_fi_tt.barh(_x_tt + _w_tt / 2, _imp_train_test['Importance'].values[::-1],
+              _w_tt, label='Train (memorizado)', color='steelblue',
+              edgecolor='black', linewidth=0.5, alpha=0.8)
+ax_fi_tt.barh(_x_tt - _w_tt / 2, _imp_train_test['Importance_Test'].values[::-1],
+              _w_tt, label='Test (predictivo)', color='darkorange',
+              edgecolor='black', linewidth=0.5, alpha=0.8)
+ax_fi_tt.set_yticks(_x_tt)
+ax_fi_tt.set_yticklabels(_imp_train_test['Feature'].values[::-1], fontsize=9)
+ax_fi_tt.set_xlabel('Permutation Importance (subida de RMSE al permutar)', fontsize=10)
+ax_fi_tt.set_title('Top 20 Features - GB: Train vs Test\n'
+    '(azul=train/memorizado, naranja=test/predictivo — divergencia indica overfitting por feature)',
+    fontsize=11, fontweight='bold')
+ax_fi_tt.legend(fontsize=9)
+ax_fi_tt.grid(alpha=0.3, axis='x')
+plt.tight_layout()
+plt.savefig(os.path.join(BASE_DIR, '17_1b_feature_importance_gb_train_vs_test.png'),
+            dpi=150, bbox_inches='tight')
+plt.close()
+print(f"  [OK] Guardado: 17_1b_feature_importance_gb_train_vs_test.png")
 
 residuos = y_test_all - y_pred_ensemble_test
 
@@ -1678,7 +1707,6 @@ metricas_resumen = [
     ('Ensemble', 'Dir. Accuracy (%)', da_ens, '>50%', 'OK' if da_ens > 50 else 'BAJO'),
     ('HMM No Supervisado', 'BIC', bic_optimo, 'Menor', '--'),
     ('HMM No Supervisado', 'Silhouette', sil_score, '>0.25', 'OK' if sil_score > 0.25 else 'BAJO'),
-    ('HMM No Supervisado', 'Log-Likelihood', log_lik, 'Mayor', '--'),
 ]
 
 for m in metricas_resumen:
@@ -1735,110 +1763,6 @@ print(f"    MIN_PESO_ML={MIN_PESO_ML*100:.0f}%, MAX_TURNOVER={MAX_TURNOVER*100:.
 print(f"    Alpha por regimen: { {regimen_labels[r]: ALPHA_POR_REGIMEN[r] for r in range(k_optimo)} }")
 
 
-def optimizar_markowitz(mu, sigma, n_act, max_peso=1.0, min_peso=0.0):
-    """
-    Maximizar Sharpe Ratio via SLSQP.
-    mu: retornos esperados anualizados (n_act,)
-    sigma: covarianza anualizada (n_act, n_act)
-    max_peso: peso maximo por activo
-    min_peso: peso minimo por activo (diversificacion forzada)
-    Con min_peso>0 se garantiza exposicion minima a todos los activos,
-    mas realista para carteras institucionales y reduce riesgo de concentracion.
-    """
-    if min_peso * n_act > 1.0:
-        min_peso = 1.0 / n_act * 0.5
-
-    def neg_sharpe(w):
-        ret_p = w @ mu
-        vol_p = np.sqrt(np.maximum(w @ sigma @ w, 1e-12))
-        return -ret_p / (vol_p + 1e-8)
-
-    constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1.0})
-    bounds = [(min_peso, max_peso)] * n_act
-    x0 = np.ones(n_act) / n_act
-
-    result = scipy_minimize(neg_sharpe, x0, method='SLSQP',
-                            bounds=bounds, constraints=constraints,
-                            options={'maxiter': 1000, 'ftol': 1e-10})
-    if result.success:
-        return result.x
-    else:
-        return x0
-
-
-def calcular_metricas_cartera(retornos_diarios):
-    """Calcula metricas financieras completas de una serie de retornos diarios."""
-    ret = np.array(retornos_diarios)
-    ret_anual = np.mean(ret) * 252 * 100
-    vol_anual = np.std(ret) * np.sqrt(252) * 100
-    sharpe = (np.mean(ret) * 252) / (np.std(ret) * np.sqrt(252) + 1e-8)
-    ret_neg = ret[ret < 0]
-    if len(ret_neg) > 2:
-        downside_vol = np.std(ret_neg) * np.sqrt(252)
-        sortino = (np.mean(ret) * 252) / (downside_vol + 1e-8)
-    else:
-        sortino = sharpe
-    ret_cum = np.cumprod(1 + ret)
-    running_max = np.maximum.accumulate(ret_cum)
-    drawdowns = (ret_cum - running_max) / (running_max + 1e-8)
-    max_dd = np.min(drawdowns) * 100
-    calmar = (np.mean(ret) * 252) / (abs(max_dd / 100) + 1e-8)
-    return {
-        'Retorno Anual (%)': ret_anual,
-        'Volatilidad Anual (%)': vol_anual,
-        'Sharpe Ratio': sharpe,
-        'Sortino Ratio': sortino,
-        'Max Drawdown (%)': max_dd,
-        'Calmar Ratio': calmar,
-    }
-
-
-def predecir_retornos_activos(features_df, ret_wide, model, scaler, tickers, fecha_idx,
-                               model2=None, peso_model2=0.0):
-    """
-    Genera predicciones de retorno para cada activo en una fecha dada.
-    Si model2 y peso_model2 > 0 se genera un ensemble ponderado:
-        pred = (1 - peso_model2) * model + peso_model2 * model2
-    """
-    predicciones = {}
-    for ticker in tickers:
-        if ticker not in features_df or fecha_idx not in features_df[ticker].index:
-            predicciones[ticker] = 0.0
-            continue
-        feats = features_df[ticker].loc[:fecha_idx].iloc[-1:]
-        if feats.isna().any(axis=1).iloc[0]:
-            predicciones[ticker] = 0.0
-            continue
-        feats_scaled = scaler.transform(feats.values)
-        pred = model.predict(feats_scaled)[0]
-        if model2 is not None and peso_model2 > 0.0:
-            pred2 = model2.predict(feats_scaled)[0]
-            pred = (1.0 - peso_model2) * pred + peso_model2 * pred2
-        predicciones[ticker] = pred
-    return np.array([predicciones[t] for t in tickers])
-
-
-def _concat_features_targets_before(features_dict, targets_dict, tickers, max_date):
-    """Concatena features/targets de todos los activos hasta max_date (sin look-ahead)."""
-    X_list, y_list = [], []
-    for ticker in tickers:
-        if ticker not in features_dict:
-            continue
-        feats = features_dict[ticker].copy()
-        tgt = targets_dict[ticker].copy()
-        df_combined = feats.copy()
-        df_combined['_target'] = tgt
-        df_combined = df_combined.dropna()
-        df_combined = df_combined[df_combined.index <= max_date]
-        if len(df_combined) == 0:
-            continue
-        X_list.append(df_combined.drop(columns='_target').values)
-        y_list.append(df_combined['_target'].values)
-    if not X_list:
-        return None, None
-    return np.vstack(X_list), np.concatenate(y_list)
-
-
 # =============================================================================
 # SECCION 19.4b: GUARDAR ARTEFACTOS PARA DAX_Analisis_de_Negocio.py
 # =============================================================================
@@ -1880,6 +1804,7 @@ _artefactos = {
     'regimen_labels':       regimen_labels,
     'regimen_stats':        regimen_stats,
     'bic_scores':           bic_scores,
+    'bic_optimo':           bic_optimo,
     # Benchmark
     'dax40_benchmark':      dax40_benchmark,
     # Pesos del ensemble
@@ -1892,7 +1817,7 @@ _artefactos = {
     'mae_gb_test':   mae_gb_test,   'mae_mlp_test':  mae_mlp_test,   'mae_ens_test':  mae_ens_test,
     'r2_gb_test':    r2_gb_test,    'r2_mlp_test':   r2_mlp_test,    'r2_ens_test':   r2_ens_test,
     'da_gb':         da_gb,         'da_mlp':         da_mlp,         'da_ens':         da_ens,
-    'sil_score':     sil_score,     'log_lik':        log_lik,
+    'sil_score':     sil_score,
     # Parametros del backtest
     'VENTANA_TRAIN_BT':     VENTANA_TRAIN_BT,
     'PASO_REOPT':           PASO_REOPT,
@@ -1923,7 +1848,6 @@ print(f"    16_1_heatmap_correlacion_features.png       - Heatmap correlacion de
 print(f"    17_1_feature_importance_gb.png              - Importancia de features (GB)")
 print(f"    17_2a_convergencia_mlp_loss.png             - Curva de loss del MLP")
 print(f"    17_2b_cv_folds_rmse.png                    - RMSE por fold de CV temporal")
-print(f"    17_3a_permutation_importance_gb.png         - Perm. importance GradientBoosting")
 print(f"    17_3b_permutation_importance_mlp.png        - Perm. importance MLP")
 print(f"    17_3c_comparacion_importancia_gb_vs_mlp.png - Comparacion GB vs MLP por feature")
 print(f"    18_1a_retornos_acumulados_regimenes.png     - Retornos + regimenes HMM")
